@@ -7,7 +7,7 @@ from conceptcx.masks.perturbation import MaskPerturbation
 from conceptcx.causal.scorer import DebiasedCausalScorer
 from conceptcx.causal.aggregate import CoverageAggregator
 
-from conceptcx.prototype.bank import ConceptPrototypes
+from vitcx.vitcx_generator import ViTCXGenerator
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -20,17 +20,6 @@ def main():
     model = model.to(device).eval()
 
     extractor = ViTExtractor(model)
-
-    # --------------------------------------------------
-    # build prototype bank from dummy train features
-    # --------------------------------------------------
-    D = model.num_features
-    train_features = torch.randn(2000, D)
-
-    prototypes = ConceptPrototypes(K=8, tau=5, device=device)
-    prototypes.fit(train_features)
-
-    print(f"Prototypes shape: {prototypes.prototypes.shape}")
 
     # --------------------------------------------------
     # dummy input images
@@ -49,40 +38,56 @@ def main():
     print(f"Grid size: {grid_size}")
 
     # --------------------------------------------------
-    # concept assignment
+    # vitcx generator
     # --------------------------------------------------
-    assignments = prototypes(features)
-    print(f"Concept assignments shape: {assignments.shape}")
+    vitcx_generator = ViTCXGenerator(image_size=224, delta=0.1)
+    batch_masks = vitcx_generator(features, grid_size=grid_size)
+
+    for i, masks in enumerate(batch_masks):
+        print(f"Image {i} - Masks shape: {masks.shape}")
 
     # --------------------------------------------------
-    # mask generation
-    # --------------------------------------------------
-    mask_generator = MaskGenerator(image_size=224)
-    masks = mask_generator(assignments, grid_size=grid_size)
-    print(f"Masks shape: {masks.shape}")
-
-    # --------------------------------------------------
-    # mask perturbation
+    # modules
     # --------------------------------------------------
     perturbation = MaskPerturbation(noise_std=0.1)
-    x_masked, x_noise = perturbation(images, masks)
-    print(f"Masked images shape: {x_masked.shape}")
-    print(f"Noisy images shape: {x_noise.shape}")
-
-    # --------------------------------------------------
-    # causal scoring
-    # --------------------------------------------------
     scorer = DebiasedCausalScorer(model)
-    scores = scorer(images, x_masked, x_noise, target_indices)
-    print(f"Causal scores shape: {scores.shape}")
+    aggregator = CoverageAggregator()
 
     # --------------------------------------------------
-    # aggregation
+    # compute saliency (loop per image)
     # --------------------------------------------------
-    aggregator = CoverageAggregator()
-    saliency = aggregator(scores, masks)
-    print(f"Saliency shape: {saliency.shape}")
-    print(f"Saliency min/max: {saliency.min()}/{saliency.max()}")
+    saliency_list = []
+
+    for i in range(B):
+        masks_i = batch_masks[i]              # [K_i, H, W]
+        K_i = masks_i.shape[0]
+
+        print(f"Image {i}: {K_i} masks")
+
+        masks_i = masks_i.unsqueeze(0).to(device)   # [1, K_i, H, W]
+
+        img_i = images[i:i+1]                       # [1,3,H,W]
+        target_i = target_indices[i:i+1]
+
+        # perturb
+        x_masked, x_noise = perturbation(img_i, masks_i)
+
+        # score
+        scores = scorer(
+            img_i,
+            x_masked,
+            x_noise,
+            target_i
+        )  # [1, K_i]
+
+        # aggregate
+        sal = aggregator(scores, masks_i)   # [1, H, W]
+
+        saliency_list.append(sal)
+
+    saliency = torch.cat(saliency_list, dim=0)
+
+    print("Final saliency:", saliency.shape)
 
 if __name__ == "__main__":
     main()

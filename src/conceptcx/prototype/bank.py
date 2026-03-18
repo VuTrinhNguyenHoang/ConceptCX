@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from sklearn.cluster import KMeans
 
 class ConceptPrototypes:
-    def __init__(self, K=64, tau=5, device="cpu", random_state=42):
+    def __init__(self, K=64, tau=5, device=torch.device("cpu"), random_state=42):
         self.K = K
         self.tau = tau
         self.prototypes = None
@@ -43,7 +43,7 @@ class ConceptPrototypes:
 
 if __name__ == "__main__":
     train_features = torch.randn(32, 64)
-    prototypes = ConceptPrototypes(K=4, tau=5, device="cpu")
+    prototypes = ConceptPrototypes(K=4, tau=5, device=torch.device("cpu"))
     prototypes.fit(train_features)
 
     print(prototypes.prototypes.shape)
