@@ -1,9 +1,11 @@
 import torch
 
 class MaskPerturbation:
-    def __init__(self, noise_std=0.1):
+    def __init__(self, noise_std=0.1, seed=42, device=torch.device('cpu')):
         self.noise_std = noise_std
-    
+        self.g = torch.Generator(device=device)
+        self.g.manual_seed(seed)
+
     def __call__(self, images, masks):
         B, C, H, W = images.shape
         _, K, _, _ = masks.shape
@@ -14,7 +16,8 @@ class MaskPerturbation:
         noise = torch.randn(
             B, K, C, H, W,
             device=images.device,
-            dtype=images.dtype
+            dtype=images.dtype,
+            generator=self.g
         ) * self.noise_std
         eps = (1 - masks) * noise
 
