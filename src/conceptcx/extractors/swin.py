@@ -12,7 +12,7 @@ class SwinExtractor:
             features = self.model.layers[i](features)
 
         B, H, W, C = features.shape
-        # features = features.view(B, H * W, C)
+        features = features.view(B, H * W, C)
 
         return features, (H, W)
 
