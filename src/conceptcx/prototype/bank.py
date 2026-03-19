@@ -1,22 +1,28 @@
 import torch
 import torch.nn.functional as F
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 
 class ConceptPrototypes:
-    def __init__(self, K=64, tau=5, device=torch.device("cpu"), random_state=42):
+    def __init__(self, K=64, tau=5, device=torch.device("cpu"), random_state=42, batch_size=4096, max_iter=300):
         self.K = K
         self.tau = tau
         self.prototypes = None
         self.device = device
         self.random_state = random_state
+        self.batch_size = batch_size
+        self.max_iter = max_iter
 
     def fit(self, features):
         features = F.normalize(features, dim=-1)
         features = features.detach().cpu().numpy()
 
-        kmeans = KMeans(
+        kmeans = MiniBatchKMeans(
             n_clusters=self.K,
             random_state=self.random_state,
+            batch_size=self.batch_size,
+            max_iter=self.max_iter,
+            max_no_improvement=30,
+            tol=0.0001,
             n_init=10
         )
         kmeans.fit(features)

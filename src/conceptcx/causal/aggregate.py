@@ -3,11 +3,10 @@ import torch
 class CoverageAggregator:
     def __call__(self, scores, masks):
         numerator = (scores[:, :, None, None] * masks).sum(dim=1)  # [B, H, W]
-        coverage = masks.mean(dim=1)                               # [B, H, W]
+        coverage = masks.sum(dim=1)                               # [B, H, W]
 
         saliency = torch.zeros_like(numerator)
-        valid = coverage > 0
-        saliency[valid] = numerator[valid] / coverage[valid]
+        saliency = numerator / (coverage + 1e-8)
 
         saliency_min = saliency.amin(dim=(-2, -1), keepdim=True)
         saliency_max = saliency.amax(dim=(-2, -1), keepdim=True)
