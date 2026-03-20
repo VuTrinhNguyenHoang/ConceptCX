@@ -5,11 +5,7 @@ class SwinExtractor:
         self.model = model.eval()
 
     def __call__(self, images):
-        features = self.model.patch_embed(images)
-
-        # stage 1-3
-        for i in range(3):
-            features = self.model.layers[i](features)
+        features = self.model.forward_features(images)
 
         B, H, W, C = features.shape
         features = features.view(B, H * W, C)
