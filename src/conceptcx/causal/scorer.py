@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 class DebiasedCausalScorer:
     def __init__(self, model):
@@ -10,19 +11,22 @@ class DebiasedCausalScorer:
 
         # f(y | X)
         logits = self.model(images)
-        base_scores = logits.gather(1, target_indices[:, None]).squeeze(1)  # [B]
+        probs = F.softmax(logits, dim=1)
+        base_scores = probs.gather(1, target_indices[:, None]).squeeze(1)  # [B]
 
         target_expand = target_indices[:, None].expand(B, K).reshape(B * K)
         # f(y | X * M + eps)
         x_masked = x_masked.reshape(B * K, C, H, W)
         masked_logits = self.model(x_masked)
-        masked_score = masked_logits.gather(1, target_expand[:, None]).squeeze(1)
+        masked_probs = F.softmax(masked_logits, dim=1)
+        masked_score = masked_probs.gather(1, target_expand[:, None]).squeeze(1)
         masked_score = masked_score.view(B, K)
 
         # f(y | X + eps)
         x_noise = x_noise.reshape(B * K, C, H, W)
         noise_logits = self.model(x_noise)
-        noise_score = noise_logits.gather(1, target_expand[:, None]).squeeze(1)
+        noise_probs = F.softmax(noise_logits, dim=1)
+        noise_score = noise_probs.gather(1, target_expand[:, None]).squeeze(1)
         noise_score = noise_score.view(B, K)
 
         alpha = masked_score + (base_scores[:, None] - noise_score)
