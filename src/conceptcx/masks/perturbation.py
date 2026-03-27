@@ -3,8 +3,18 @@ import torch
 class MaskPerturbation:
     def __init__(self, noise_std=0.1, seed=42, device=torch.device('cpu')):
         self.noise_std = noise_std
-        self.g = torch.Generator(device=device)
+        self.seed = seed
+        self.generator_device = torch.device(device)
+        self.g = torch.Generator(device=self.generator_device)
         self.g.manual_seed(seed)
+
+    def _get_generator(self, device):
+        device = torch.device(device)
+        if device != self.generator_device:
+            self.generator_device = device
+            self.g = torch.Generator(device=self.generator_device)
+            self.g.manual_seed(self.seed)
+        return self.g
 
     def __call__(self, images, masks):
         B, C, H, W = images.shape
@@ -12,12 +22,13 @@ class MaskPerturbation:
 
         images = images.unsqueeze(1)        # [B, 1, C, H, W]
         masks = masks.unsqueeze(2)          # [B, K, 1, H, W]
+        generator = self._get_generator(images.device)
 
         noise = torch.randn(
             B, K, C, H, W,
             device=images.device,
             dtype=images.dtype,
-            generator=self.g
+            generator=generator
         ) * self.noise_std
         eps = (1 - masks) * noise
 
