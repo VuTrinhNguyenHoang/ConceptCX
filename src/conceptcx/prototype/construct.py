@@ -1,7 +1,9 @@
 import math
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 
 
@@ -298,3 +300,223 @@ def compute_prototype_metrics(X, P, tau, labels=None, silhouette_samples=5000):
             )
 
     return metrics
+
+
+@torch.no_grad()
+def collect_class_features(
+    extractor,
+    loader,
+    device,
+    patches_per_image=20,
+    top_ratio=0.8,
+    mid_range=(0.25, 0.75),
+):
+    class_features = defaultdict(list)
+    class_selected_norms = defaultdict(list)
+    class_top_norms = defaultdict(list)
+    class_mid_norms = defaultdict(list)
+
+    total_images = 0
+    total_top = 0
+    total_mid = 0
+
+    for batch in loader:
+        images, labels = _unpack_batch(batch)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        feats, _ = extractor(images)
+        batch_size, _, channels = feats.shape
+        patch_norms = feats.norm(dim=-1)
+        selected_idx, top_idx, mid_idx = _select_top_mid_indices(
+            patch_norms,
+            patches_per_image=patches_per_image,
+            top_ratio=top_ratio,
+            mid_range=mid_range,
+        )
+
+        selected = torch.gather(
+            feats,
+            dim=1,
+            index=selected_idx.unsqueeze(-1).expand(batch_size, selected_idx.shape[1], channels),
+        )
+        selected_norm = torch.gather(patch_norms, 1, selected_idx)
+        top_norm = torch.gather(patch_norms, 1, top_idx)
+        mid_norm = torch.gather(patch_norms, 1, mid_idx) if mid_idx is not None else None
+
+        for i in range(batch_size):
+            class_idx = int(labels[i].item())
+
+            class_features[class_idx].append(selected[i].detach().cpu())
+            class_selected_norms[class_idx].append(selected_norm[i].reshape(-1).detach().cpu())
+            class_top_norms[class_idx].append(top_norm[i].reshape(-1).detach().cpu())
+            if mid_norm is not None:
+                class_mid_norms[class_idx].append(mid_norm[i].reshape(-1).detach().cpu())
+
+            total_top += int(top_idx.shape[1])
+            if mid_idx is not None:
+                total_mid += int(mid_idx.shape[1])
+
+        total_images += batch_size
+
+    features_by_class = {}
+    per_class_stats = []
+
+    for class_idx in sorted(class_features):
+        x_class = torch.cat(class_features[class_idx], dim=0).float()
+        features_by_class[int(class_idx)] = x_class
+
+        selected_norm_mean, selected_norm_std = _tensor_stats(class_selected_norms[class_idx])
+        top_norm_mean, top_norm_std = _tensor_stats(class_top_norms[class_idx])
+        mid_norm_mean, mid_norm_std = _tensor_stats(class_mid_norms[class_idx])
+        feature_norm = x_class.norm(dim=-1)
+        support_images = len(class_features[class_idx])
+
+        per_class_stats.append(
+            {
+                "class_idx": int(class_idx),
+                "support_images": int(support_images),
+                "support_features": int(x_class.shape[0]),
+                "feature_dim": int(x_class.shape[1]),
+                "patches_per_image": float(x_class.shape[0] / support_images),
+                "selected_norm_mean": selected_norm_mean,
+                "selected_norm_std": selected_norm_std,
+                "top_norm_mean": top_norm_mean,
+                "top_norm_std": top_norm_std,
+                "mid_norm_mean": mid_norm_mean,
+                "mid_norm_std": mid_norm_std,
+                "feature_norm_mean": float(feature_norm.mean().item()),
+                "feature_norm_std": float(feature_norm.std(unbiased=False).item()),
+            }
+        )
+
+    total_selected = max(total_top + total_mid, 1)
+    support_counts = torch.tensor([row["support_images"] for row in per_class_stats], dtype=torch.float32)
+    summary = {
+        "num_classes_collected": int(len(features_by_class)),
+        "total_images": int(total_images),
+        "total_support_images": int(sum(row["support_images"] for row in per_class_stats)),
+        "total_support_features": int(sum(x.shape[0] for x in features_by_class.values())),
+        "sampling_top_ratio": float(total_top / total_selected),
+        "sampling_mid_ratio": float(total_mid / total_selected),
+        "mid_quantile_low": float(mid_range[0]),
+        "mid_quantile_high": float(mid_range[1]),
+        "support_images_per_class_mean": float(support_counts.mean().item()),
+        "support_images_per_class_min": int(support_counts.min().item()),
+        "support_images_per_class_max": int(support_counts.max().item()),
+    }
+
+    return features_by_class, per_class_stats, summary
+
+
+@torch.no_grad()
+def build_classwise_prototypes(
+    features_by_class,
+    distance_threshold=0.1,
+    use_medoid=True,
+):
+    prototypes_by_class = {}
+    per_class_metrics = []
+
+    concepts_per_class = []
+    total_support_features = 0
+
+    for class_idx in sorted(features_by_class):
+        x = features_by_class[class_idx].float()
+        x_unit = F.normalize(x, dim=-1)
+        total_support_features += int(x_unit.shape[0])
+
+        agg = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=float(distance_threshold),
+            metric="cosine",
+            linkage="average",
+            compute_full_tree=True,
+        )
+        labels = torch.from_numpy(agg.fit_predict(x_unit.cpu().numpy())).long()
+
+        unique_labels = labels.unique(sorted=True)
+        cluster_entries = []
+
+        for cluster_id in unique_labels.tolist():
+            member_idx = torch.nonzero(labels == cluster_id, as_tuple=False).squeeze(1)
+            members = x_unit[member_idx]
+            size = int(member_idx.numel())
+
+            center = F.normalize(members.mean(dim=0, keepdim=True), dim=-1).squeeze(0)
+            if use_medoid:
+                sims_to_center = members @ center
+                best_local_idx = int(sims_to_center.argmax().item())
+                prototype = members[best_local_idx]
+            else:
+                prototype = center
+
+            member_sims = members @ prototype
+            cluster_entries.append(
+                {
+                    "cluster_id": int(cluster_id),
+                    "size": size,
+                    "prototype": prototype,
+                    "member_sim_mean": float(member_sims.mean().item()),
+                    "member_sim_std": float(member_sims.std(unbiased=False).item()),
+                }
+            )
+
+        cluster_entries.sort(key=lambda entry: (-entry["size"], entry["cluster_id"]))
+        prototypes = torch.stack([entry["prototype"] for entry in cluster_entries], dim=0)
+        prototypes = F.normalize(prototypes, dim=-1)
+        prototypes_by_class[int(class_idx)] = prototypes.cpu()
+
+        cluster_sizes = torch.tensor([entry["size"] for entry in cluster_entries], dtype=torch.float32)
+        cluster_sim_mean = torch.tensor([entry["member_sim_mean"] for entry in cluster_entries], dtype=torch.float32)
+        cluster_sim_std = torch.tensor([entry["member_sim_std"] for entry in cluster_entries], dtype=torch.float32)
+
+        if prototypes.shape[0] > 1:
+            proto_sim = prototypes @ prototypes.T
+            off_diag_mask = ~torch.eye(prototypes.shape[0], dtype=torch.bool)
+            off_diag = proto_sim[off_diag_mask]
+            proto_sim_mean = float(off_diag.mean().item())
+            proto_sim_max = float(off_diag.max().item())
+            proto_sim_p95 = float(torch.quantile(off_diag, 0.95).item())
+        else:
+            proto_sim_mean = 0.0
+            proto_sim_max = 0.0
+            proto_sim_p95 = 0.0
+
+        concepts_per_class.append(int(prototypes.shape[0]))
+        per_class_metrics.append(
+            {
+                "class_idx": int(class_idx),
+                "support_features": int(x_unit.shape[0]),
+                "num_concepts": int(prototypes.shape[0]),
+                "raw_clusters": int(len(cluster_entries)),
+                "singleton_clusters": int((cluster_sizes == 1).sum().item()),
+                "cluster_size_min": int(cluster_sizes.min().item()),
+                "cluster_size_max": int(cluster_sizes.max().item()),
+                "cluster_size_mean": float(cluster_sizes.mean().item()),
+                "cluster_size_std": float(cluster_sizes.std(unbiased=False).item()),
+                "cluster_size_cv": float(cluster_sizes.std(unbiased=False).item() / (cluster_sizes.mean().item() + _EPS)),
+                "intra_cluster_sim_mean": float(cluster_sim_mean.mean().item()),
+                "intra_cluster_sim_std": float(cluster_sim_std.mean().item()),
+                "proto_sim_mean": proto_sim_mean,
+                "proto_sim_max": proto_sim_max,
+                "proto_sim_p95": proto_sim_p95,
+                "distance_threshold": float(distance_threshold),
+                "use_medoid": bool(use_medoid),
+            }
+        )
+
+    concepts_tensor = torch.tensor(concepts_per_class, dtype=torch.float32) if concepts_per_class else torch.zeros(0)
+    summary = {
+        "num_classes_built": int(len(prototypes_by_class)),
+        "total_support_features": int(total_support_features),
+        "total_concepts": int(concepts_tensor.sum().item()) if concepts_tensor.numel() else 0,
+        "concepts_per_class_mean": float(concepts_tensor.mean().item()) if concepts_tensor.numel() else 0.0,
+        "concepts_per_class_min": int(concepts_tensor.min().item()) if concepts_tensor.numel() else 0,
+        "concepts_per_class_max": int(concepts_tensor.max().item()) if concepts_tensor.numel() else 0,
+        "concepts_per_class_std": float(concepts_tensor.std(unbiased=False).item()) if concepts_tensor.numel() else 0.0,
+        "distance_threshold": float(distance_threshold),
+        "use_medoid": bool(use_medoid),
+    }
+
+    return prototypes_by_class, per_class_metrics, summary
