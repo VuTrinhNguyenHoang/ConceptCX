@@ -3,9 +3,19 @@ import torch.nn.functional as F
 from sklearn.cluster import MiniBatchKMeans
 
 class ConceptPrototypes:
-    def __init__(self, K=64, tau=5, device=torch.device("cpu"), random_state=42, batch_size=4096, max_iter=300):
+    def __init__(
+        self,
+        K=64,
+        tau=5,
+        top_m=None,
+        device=torch.device("cpu"),
+        random_state=42,
+        batch_size=4096,
+        max_iter=300,
+    ):
         self.K = K
         self.tau = tau
+        self.top_m = top_m
         self.prototypes = None
         self.device = device
         self.random_state = random_state
@@ -36,7 +46,7 @@ class ConceptPrototypes:
     def save(self, path):
         torch.save(self.prototypes.cpu(), path)
 
-    def __call__(self, features):
+    def __call__(self, features, tau=None, top_m=None):
         features = F.normalize(features, dim=-1)
 
         sim = torch.einsum(
@@ -45,11 +55,20 @@ class ConceptPrototypes:
             self.prototypes
         )
 
-        return F.softmax(self.tau * sim, dim=-1)
+        tau = self.tau if tau is None else tau
+        top_m = self.top_m if top_m is None else top_m
+
+        if top_m is not None and 0 < top_m < sim.shape[-1]:
+            top_values, top_indices = torch.topk(sim, k=int(top_m), dim=-1)
+            sparse_sim = torch.full_like(sim, float("-inf"))
+            sparse_sim.scatter_(-1, top_indices, top_values)
+            sim = sparse_sim
+
+        return F.softmax(float(tau) * sim, dim=-1)
 
 if __name__ == "__main__":
     train_features = torch.randn(32, 64)
-    prototypes = ConceptPrototypes(K=4, tau=5, device=torch.device("cpu"))
+    prototypes = ConceptPrototypes(K=4, tau=5, top_m=2, device=torch.device("cpu"))
     prototypes.fit(train_features)
 
     print(prototypes.prototypes.shape)
